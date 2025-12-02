@@ -1,0 +1,116 @@
+/**
+ * PIMA Force Siren (Child)
+ * Namespace: amithalp
+ * Author: Amit Halperin
+ *
+ * Represents a PIMA siren/output as a standard Hubitat Switch + Alarm.
+ * PIMA ONLY supports ON/OFF, so all Alarm actions map to on()/off().
+ */
+
+metadata {
+    definition(name: "PIMA Force Siren", namespace: "amithalp", author: "Amit Halperin") {
+        capability "Actuator"
+        capability "Switch"     // on/off
+        capability "Alarm"      // required by Hubitat; mapped to on/off only
+
+        // Optional but recommended for consistency with panel/zones/partitions
+        attribute "lastEvent",   "string"
+        attribute "lastEventTs", "string"
+    }
+
+    preferences {
+        input name: "prefDebug", type: "bool", title: "Enable debug logging", defaultValue: true
+        input name: "prefTrace", type: "bool", title: "Enable trace logging", defaultValue: false
+    }
+}
+
+
+/* ------------------------- lifecycle -------------------------- */
+
+def installed() {
+    logInfo "installed"
+    sendEvent(name: "switch", value: "off")
+    sendEvent(name: "alarm",  value: "off")
+}
+
+def updated() {
+    logInfo "updated"
+}
+
+/* ----------------------- Switch commands ---------------------- */
+
+def on() {
+    logInfo "ON"
+    logDebug "calling parent.sirenOn(${device.deviceNetworkId})"
+    parent?.sirenOn(device.deviceNetworkId)
+}
+
+def off() {
+    logInfo "OFF"
+    logDebug "calling parent.sirenOff(${device.deviceNetworkId})"
+    parent?.sirenOff(device.deviceNetworkId)
+}
+
+/* -------------------- Alarm capability API -------------------- */
+/* Hubitat's Alarm capability requires implementing these methods.
+ * PIMA does NOT support strobe/both modes, so everything forwards to on/off.
+ */
+
+def siren() {
+    logDebug "siren() → ON"
+    on()
+}
+
+def strobe() {
+    logDebug "strobe() → ON (PIMA has no strobe mode)"
+    on()
+}
+
+def both() {
+    logDebug "both() → ON (PIMA single siren only)"
+    on()
+}
+
+def offAlarm() {
+    logDebug "offAlarm() → OFF"
+    off()
+}
+
+/* ---------------------- parent callbacks ---------------------- */
+
+def updateStateFromParent(String state) {
+    def norm = (state?.toLowerCase() == "on") ? "on" : "off"
+    logDebug "updateStateFromParent(${norm})"
+    _setSwitchIfChanged(norm)
+}
+
+/* ------------------------- utilities -------------------------- */
+
+private void _setSwitchIfChanged(String val) {
+    def cur = (device.currentValue("switch") ?: "").toString()
+    if (cur == val) {
+        logTrace "switch already '${val}', suppressing duplicate event"
+        return
+    }
+    sendEvent(name: "switch", value: val)
+    _setAlarmFromSwitch(val)
+    logInfo "state → ${val}"
+}
+
+private void _setAlarmFromSwitch(String val) {
+    String alarmVal = (val == "on") ? "siren" : "off"
+    def cur = (device.currentValue("alarm") ?: "").toString()
+    if (cur == alarmVal) {
+        logTrace "alarm already '${alarmVal}', suppressing duplicate event"
+        return
+    }
+    sendEvent(name: "alarm", value: alarmVal)
+    logDebug "alarm → ${alarmVal}"
+}
+
+/* ------------------------- logging helpers -------------------- */
+
+private logInfo(msg)  { log.info  "[SIREN ${device.displayName}] ${msg}" }
+private logDebug(msg) { if (prefDebug) log.debug "[SIREN ${device.displayName}][DBG] ${msg}" }
+private logTrace(msg) { if (prefTrace) log.debug "[SIREN ${device.displayName}][TRACE] ${msg}" }
+private logWarn(msg)  { log.warn  "[SIREN ${device.displayName}] ${msg}" }
