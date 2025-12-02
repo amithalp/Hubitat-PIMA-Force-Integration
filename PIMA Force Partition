@@ -1,0 +1,294 @@
+/**
+ * PIMA Force Partition (Child)
+ * Namespace: amithalp
+ * Author: Amit Halperin
+ *
+ * Purpose
+ * - Represents a single partition (area) of the PIMA Force panel.
+ * - Holds partition-scoped state (mode/ready/alarm/delays/bypass summary).
+ * - Forwards arm/disarm commands to the parent "PIMA Force Alarm Panel".
+ *
+ * Data flow
+ * - Parent calls child.applyPartition(Map p) with payload for this partition:
+ *   {
+ *     partitionId: 1,
+ *     partitionName: "Main",
+ *     status: { code: 3, label: "Armed Away" },
+ *     mode: "armedAway",
+ *     ready: "ready",
+ *     alarm: "idle",
+ *     exitDelay: 0,
+ *     entryDelay: 0,
+ *     trouble: "ok",
+ *     bypassedZones: [7,15],
+ *     rssi: 3,
+ *     ts: "2025-11-12T12:34:56+02:00",
+ *     lastEvent: "armedAway",
+ *     lastEventTs: "2025-11-12T12:34:56+02:00"
+ *   }
+ */
+
+import groovy.json.JsonOutput
+
+metadata {
+    definition(name: "PIMA Force Partition", namespace: "amithalp", author: "Amit Halperin") {
+        capability "Initialize"
+        capability "Sensor"
+        capability "Refresh"
+
+        // Optional for Dashboard compatibility; these commands exist on this capability:
+        // setArmedAway(), setArmedHome(), setArmedNight(), disarm()
+        capability "SecurityKeypad"
+
+        // Identity
+        attribute "partitionId", "number"
+        attribute "partitionName", "string"
+        attribute "exists", "ENUM"       // "true" / "false"
+
+        // Core state
+        attribute "mode", "string"          // disarmed | armedAway | armedStay | armedNight | home1..home4 | shabbatOn | shabbatOff
+        attribute "ready", "string"         // ready | notReady
+        attribute "alarm", "string"         // idle | prealarm | alarm | fire | burglar | panic | duress
+        attribute "trouble", "string"       // ok | acFail | batteryLow | commFail | phoneLine | tamper | ...
+
+        // Delays
+        attribute "exitDelay", "number"     // seconds
+        attribute "entryDelay", "number"    // seconds
+
+        // Bypass summary (partition-scoped when available)
+        attribute "bypassedCount", "number"
+        attribute "bypassedZones", "string" // JSON array of zoneIds
+
+        // Telemetry / last markers
+        attribute "rssi", "number"
+        attribute "lastEvent", "string"
+        attribute "lastEventTs", "string"
+        attribute "partitionStatus", "string" // JSON: {code,label}
+
+        // Commands (forwarded to parent)
+        command "armAway"
+        command "armStay"
+        command "armNight"
+        command "disarm", [[name:"pin", type:"STRING", description:"Optional PIN (fallbacks to parent pref)"]]
+        command "shabbatOn"
+        command "shabbatOff"
+
+        // (PGM at partition scope if applicable on your panel)
+        command "pgmOn",  [[name:"pgmId*", type:"NUMBER"], [name:"seconds", type:"NUMBER"]]
+        command "pgmOff", [[name:"pgmId*", type:"NUMBER"]]
+    }
+
+    preferences {
+        input name:"prefDebug",     type:"bool",  title:"Enable debug logging", defaultValue:true
+        input name:"prefSpamGuard", type:"bool",  title:"Coalesce duplicate events (spam guard)", defaultValue:true
+    }
+
+}
+
+/* ===== Lifecycle ===== */
+
+def installed() {
+    // For convenience in Rule Machine / dashboards:
+    sendEvent(name:"bypassedCount", value: 0)
+    sendEvent(name:"mode", value: "disarmed")
+    sendEvent(name:"ready", value: "notReady")
+    sendEvent(name:"alarm", value: "idle")
+    sendEvent(name:"trouble", value: "ok")
+    initialize()
+}
+
+def updated() {
+    initialize()
+}
+
+def initialize() {
+    logInfo "initialized"
+    // If you want, trigger a refresh of the partition:
+    // refresh()
+}
+
+
+/* ===== Parent → Child apply ===== */
+
+/**
+ * applyPartition(Map p)
+ * Called by the parent when new data arrives for this partition.
+ */
+def applyPartition(Map p) {
+    if (!(p?.partitionId)) { logWarn("applyPartition missing partitionId: ${p}"); return }
+
+    // Identity / name
+    _setIf(p, "partitionId")
+    _setIf(p, "partitionName")
+
+    // Core state
+    _setIf(p, "mode")
+    _setIf(p, "ready")
+    _setIf(p, "alarm")
+    _setIf(p, "trouble")
+
+    // Delays
+    if (p.containsKey("exitDelay")) sendEvent(name:"exitDelay", value: (p.exitDelay as Integer))
+    if (p.containsKey("entryDelay")) sendEvent(name:"entryDelay", value: (p.entryDelay as Integer))
+
+    // Bypass summary
+    if (p.containsKey("bypassedZones")) {
+        List bz = (p.bypassedZones instanceof Collection) ? p.bypassedZones as List : []
+        sendEvent(name:"bypassedZones", value: JsonOutput.toJson(bz))
+        sendEvent(name:"bypassedCount", value: (bz?.size() ?: 0) as Integer)
+    }
+
+    // Telemetry / status descriptors
+    if (p.containsKey("rssi")) sendEvent(name:"rssi", value: (p.rssi as Integer))
+    if (p.status instanceof Map) _setIfJson([partitionStatus: p.status], "partitionStatus")
+
+    // Event markers
+    if (p.ts)        sendEvent(name:"lastEventTs", value: p.ts.toString())
+    if (p.lastEvent) sendEvent(name:"lastEvent",   value: p.lastEvent.toString())
+}
+
+/* ===== Commands → forward to parent ===== */
+
+def refresh() {
+    _forward("refresh")
+}
+
+def armAway()  { _forward("armAway") }
+def armStay()  { _forward("armStay") }   // maps to “home/stay” mode as defined on your panel
+def armNight() { _forward("armNight") }
+def disarm(String pin=null) { _forward("disarm", [pin: pin]) }
+
+def shabbatOn()  { _forward("shabbatOn") }
+def shabbatOff() { _forward("shabbatOff") }
+
+def pgmOn(Number pgmId, Number seconds=null)  { _forward("pgmOn",  [pgmId: pgmId, seconds: seconds]) }
+def pgmOff(Number pgmId)                      { _forward("pgmOff", [pgmId: pgmId]) }
+
+// SecurityKeypad capability mappings (common Dashboard tiles)
+def setArmedAway()  { armAway() }
+def setArmedHome()  { armStay() }
+def setArmedNight() { armNight() }
+
+/* ===== Helpers ===== */
+
+// Forward a command to the parent with this partitionId attached
+private _forward(String op, Map extra=[:]) {
+    Integer pid = device.currentValue("partitionId") as Integer
+    if (!pid) { logWarn("No partitionId set; cannot forward ${op}"); return }
+
+    if (!parent) { logWarn("No parent device; cannot forward ${op}"); return }
+
+    switch (op) {
+        case "armAway":   parent.armAway(pid); break
+        case "armStay":   parent.armStay(pid); break
+        case "armNight":  parent.armNight(pid); break
+        case "disarm":    parent.disarm(pid, (extra.pin ?: null)); break
+        case "shabbatOn":  if (parent.respondsTo("shabbatOn"))  parent.shabbatOn(pid);  break
+        case "shabbatOff": if (parent.respondsTo("shabbatOff")) parent.shabbatOff(pid); break
+        case "pgmOn":     parent.pgmOn(extra.pgmId as Integer, extra.seconds as Integer); break
+        case "pgmOff":    parent.pgmOff(extra.pgmId as Integer); break
+        case "refresh":
+            if (parent.respondsTo("refreshPartition")) parent.refreshPartition(pid)
+            else if (parent.respondsTo("refresh"))     parent.refresh()
+            break
+        default:
+            logWarn("Unknown op ${op}")
+    }
+}
+
+// Direct keypad “Arm Home” → treat as Stay. armHome comes default with the SecurityKeypad capability
+def armHome() {
+    armStay()
+}
+
+
+// Called by parent when partition mode changes due to PIMA EVENT
+def notifyModeChange(String newMode, String detail, String codeStr, String ts) {
+    def pid = device.currentValue("partitionId") ?: "?"
+
+    // DEBUG: full technical context
+    logDebug "notifyModeChange(): partition=${pid}, mode=${newMode}, detail='${detail}', code=${codeStr}, ts=${ts}"
+
+    // INFO: simple, user-facing
+    def msg = detail ? "mode -> ${newMode} (${detail})" : "mode -> ${newMode}"
+    logInfo msg
+
+    sendEvent(
+        name: "mode",
+        value: newMode,
+        descriptionText: "Partition ${pid} mode -> ${newMode} (${detail})"
+    )
+    sendEvent(name: "lastEvent",   value: "${codeStr}:${detail}")
+    sendEvent(name: "lastEventTs", value: ts)
+}
+
+// Called by parent for partition arm/disarm events
+def notifyPartitionArmEvent(String newMode,
+                            Integer type,
+                            Integer qual,
+                            Integer zoneField,
+                            Integer part,
+                            String detail,
+                            String codeStr,
+                            String ts) {
+
+    def pid = device.currentValue("partitionId") ?: part ?: "?"
+
+    // DEBUG: full technical context
+    logDebug "notifyPartitionArmEvent(): partition=${pid}, type=${type}, qual=${qual}, " +
+             "zoneField=${zoneField}, mode=${newMode}, detail='${detail}', code=${codeStr}, ts=${ts}"
+
+    // INFO: concise, user-facing (e.g. "Partition Main armedAway via keyswitch (keyswitchZone=19)")
+    // `detail` already carries a human string like "armedAway via keyswitch (keyswitchZone=19)"
+    def msg = detail ?: "mode -> ${newMode}"
+    logInfo msg
+
+    sendEvent(
+        name: "mode",
+        value: newMode,
+        descriptionText: "Partition ${pid} mode -> ${newMode} (${detail})"
+    )
+    sendEvent(name: "lastEvent",   value: "${codeStr}:${detail}")
+    sendEvent(name: "lastEventTs", value: ts)
+}
+
+/* ===== Event send helpers ===== */
+
+private _setIf(Map m, String key) {
+    if (!m.containsKey(key)) return
+    def val = m[key]
+    if (prefSpamGuard) {
+        def cur = device.currentValue(key)
+        if (cur?.toString() == val?.toString()) return
+    }
+    sendEvent(name:key, value: val)
+}
+
+private _setIfJson(Map m, String key) {
+    if (!m.containsKey(key)) return
+    def json = JsonOutput.toJson(m[key])
+    if (prefSpamGuard) {
+        def cur = device.currentValue(key)
+        if (cur?.toString() == json) return
+    }
+    sendEvent(name:key, value: json)
+}
+
+/* ===== Logging ===== */
+
+private logInfo(msg) {
+    def pid   = device.currentValue('partitionId') ?: '?'
+    def pname = device.currentValue('partitionName')
+    def prefix = pname ? "Partition ${pname}" : "Partition ${pid}"
+    log.info "${prefix} ${msg}"
+}
+
+private logDebug(msg) {
+    if (prefDebug) {
+        log.debug "[PART ${device.currentValue('partitionId') ?: '?'}] ${msg}"
+    }
+}
+
+private logWarn(msg) {
+    log.warn "[PART ${device.currentValue('partitionId') ?: '?'}] ${msg}"
+}
