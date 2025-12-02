@@ -1,0 +1,1776 @@
+/**
+ * To to: 
+ * 		- test Receiving Partition and Panel events
+ * 		- make sure ALARM ON and OFF are registered as events in the partition level / see chatGpt for events sent to hubitat
+ *		- DONE - make sure 770 events are handled as siren events and reqistered at the siren device
+ * 		- DONE - Create Siren virtual switch devies as part of the discovery process
+ * 		- MOSTLY DONE - implement send OPERATIONS from Hubitat to PIMA
+ * 		- DONE - change child devices (zones and partitions) names
+ * 		- DONE - include info.logs in child device level
+ * 		- devices type in hubitat - think also of an option to set a device type for each device according to its real capabilities
+ *		- make sure that updating zones in PIMA gets update (additions, changes and deletions) in Hubitat
+ *		- work on documentation
+ * 		- DONE - make sure all jogs show up at child level aso (zone, partition, siren)
+ * 		- Implement data request for sirens - got an official respose  from PIMA this is not yet supported
+ *
+ *
+ * PIMA Force Alarm Panel (Parent)
+ * Namespace: amithalp
+ * Author: Amit Halperin
+ *
+ * Purpose
+ * -------
+ * Represents a single PIMA Force alarm panel and bridges Hubitat <-> Node-RED:
+ *
+ * Hubitat → Node-RED
+ *   - syncConfig(): POST a snapshot (panel creds, Maker API callback, device id) so Node-RED can operate autonomously.
+ *   - startDiscovery(): emits a soft "discover" request via attributes; Node-RED performs 2148 → 260 → 2149 → 2250 → 411.
+ *   - User operations: arm/disarm/bypass/PGM/sendOperation → POST to /pima/op (Node-RED translates to PIMA protocol).
+ *   - pollPartitions(): soft trigger for Node-RED to run DATA-REQ 2310 (partition key status).
+ *
+ * Node-RED → Hubitat
+ *   - processData(String json): receives DATA/CFG-style payloads of kind:
+ *       * "panel"     : panel-level scalars and structured objects (faults, users, zoneStatus, partitions).
+ *       * "zone"      : single zone update (forwarded to zone child via applyZone(Map)).
+ *       * "partition" : single partition update (forwarded to partition child via applyPartition(Map)).
+ *       * "bulk"      : aggregated panel + [zones] (+ optionally [partitions]).
+ *   - pimaEvent(String eventJson): receives real-time PIMA EVENT frames (frame_type:"event") from Node-RED and routes them:
+ *       * Zone events   : 760 (open/close), 130 (intrusion alarm/restore) → zone children.
+ *       * Partition events: 400/401/403/407/408/409/441 (arm/disarm/Home/Shabbat) → partition children.
+ *       * System-major events: 301/302/305/312/350/351/145/321/322/344/342 (power, battery, comm, tamper, jamming, siren, expander)
+ *         → parent-level attributes/logs, optimized for smart-home use (minimal noise).
+ *
+ * Design
+ * ------
+ * - Scalar attributes are strings/numbers updated only when keys exist (with spam guard to coalesce duplicates).
+ * - Structured objects (faults, users, zoneStatus, partitions) are stored as JSON attributes AND mirrored in state for apps/rules.
+ * - Node-RED is driven by "soft" requests via attributes (nrRequest + nrReqCtr); this avoids tight coupling to HTTP success paths.
+ * - Zone children: auto-created on demand when enabled; expose PIMA zones as Hubitat sensors (contact + alarmState + metadata).
+ * - Partition children: auto-created/maintained from DATA-REQ 2310 and updated in real time from EVENT frames (mode/ready/alarm/bypass summary).
+ * - EVENT stream (pimaEvent):
+ *     * Interpreted with a smart-home focus: only key zone, partition, and major system events are modeled; the rest are ignored or debug-logged.
+ *     * Keeps automations responsive (immediate arm/disarm and zone state) while leaving detailed alarm supervision to the PIMA panel/keypads.
+ * - Logging: debug/trace are runtime-configurable; critical paths use warn/info selectively to avoid chatter.
+ *
+ * Notes
+ * -----
+ * - PIMA event type 138 (zone-related, likely pre-alarm/entry timing) is currently ignored.
+ *   It is only logged at debug level for troubleshooting and does not affect any child state.
+ */
+
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+import groovy.transform.Field
+
+
+/* ============================== */
+/* ========== CONSTANTS ========= */
+/* ============================== */
+
+private String _ns() { "amithalp" }                 // namespace helper
+//private static final String CHILD_TYPE_PART = "PIMA Force Partition"  // must match child driver 'metadata name'
+// SUGGEST REMOVE: You also have _childTypePart() below in your draft; keep a single source of truth.
+
+/* ============================== */
+/* ========== METADATA ========== */
+/* ============================== */
+
+metadata {
+    definition(name: "PIMA Force Alarm Panel", namespace: "amithalp", author: "Amit Halperin") {
+        /* Core lifecycle */
+        capability "Initialize"
+        capability "Refresh"
+        capability "Configuration"
+        // SUGGEST REMOVE: capability "Polling" (method poll() is empty; if unused by any app, consider removing)
+        capability "Sensor"
+
+        /* Identity/telemetry */
+        attribute "nodeRedPort", "number"
+        attribute "supportedOperations", "string"
+        attribute "lastOperation", "string"
+        attribute "lastOperationResult", "string"  // ok|nack|timeout|error
+        attribute "lastOperationTs", "string"
+
+        /* Panel state */
+        attribute "panelStatus", "string"       // online|offline|connecting|error
+        attribute "heartbeatTs", "string"       // ISO8601
+        attribute "bridgeState", "string"       // up|down
+        attribute "linkState", "string"         // idle|waitingAck|rateLimited
+        attribute "panelMode", "string"         // ready|notReady|armedStay|armedAway|armedNight|exitDelay|entryDelay|programming
+        attribute "alarmState", "string"        // idle|prealarm|alarm|fire|burglar|panic|duress
+        attribute "trouble", "string"           // ok|acFail|batteryLow|commFail|phoneLine|tamper|zoneFault|auxFault|sirenFault|keypadFault|gsmFault|powerRestore|batteryRestore
+        attribute "systemTrouble", "string"     // ok | trouble
+        attribute "acPower", "string"           // ok|fail
+        attribute "battery", "number"           // 0..100
+        //attribute "rssi", "number"
+        //attribute "model", "string"
+        //attribute "fwVersion", "string"
+        attribute "account", "string"
+        attribute "zones", "number"
+        attribute "lastPanelEvent", "string"
+        attribute "lastPanelEventTs", "string"  // ISO8601
+        attribute "protocolCounter", "number"
+        //attribute "moreData", "string"          // no|yes
+        
+
+        /* Discovery handshake with Node-RED */
+        attribute "discoveryState", "string"    // idle|requested|inProgress|done|error
+        attribute "discoveryLastTs", "string"
+        attribute "nrRequest", "string"         // JSON of last request emitted to NR (for debugging/flows)
+        attribute "nrReqCtr", "number"          // monotonically increasing counter of requests
+
+        /* Structured data (JSON strings; mirrored in state) */
+        attribute "faults", "string"            // JSON array
+        attribute "users", "string"             // JSON array [{userId,name}]
+        attribute "zoneStatus", "string"        // JSON {activeZones:[...]}
+        attribute "bypassedZones", "string"     // JSON array of zoneIds
+        attribute "bypassedCount", "number"
+        //attribute "partitionStatus", "string"   // JSON: [{partitionId, code, label}]
+        attribute "partitions", "string"        // JSON: same as above; “partitionStatus” retained for compatibility
+        attribute "partitionCount", "number"
+
+        /* Node-RED entry & user-facing commands */
+        command "processData", [[name:"json*", type:"STRING"]]   // Node-RED -> Hubitat
+        command "syncConfig"                                     // Hubitat -> Node-RED
+
+        command "startDiscovery"
+        command "startZoneNames"  // manual test hook
+        command "startZoneCount"  // manual test hook
+        command "pollPartitions"  // triggers Node-RED to run DATA-REQ 2310
+
+        command "armStay",     [[name:"partition*", type:"NUMBER"]]
+        command "armAway",     [[name:"partition*", type:"NUMBER"]]
+        command "armNight",    [[name:"partition*", type:"NUMBER"]]
+        command "disarm",      [[name:"partition*", type:"NUMBER"], [name:"pin", type:"STRING"]]
+        command "bypassZone",  [[name:"zoneId*", type:"NUMBER"], [name:"partition", type:"NUMBER"]]
+        command "clearBypass", [[name:"zoneId*", type:"NUMBER"], [name:"partition", type:"NUMBER"]]
+        command "pgmOn",       [[name:"pgmId*", type:"NUMBER"], [name:"seconds", type:"NUMBER"]]
+        command "pgmOff",      [[name:"pgmId*", type:"NUMBER"]]
+        command "sendOperation", [
+            [name:"opCode*", type:"STRING"], [name:"p1", type:"STRING"], [name:"p2", type:"STRING"], [name:"p3", type:"STRING"], [name:"raw", type:"STRING"]
+        ]
+        command "pimaEvent", [[name: "eventJson", type: "STRING", description: "PIMA EVENT frame as JSON"]]
+
+    }
+
+    /* Preferences → propagated to Node-RED by syncConfig() */
+    preferences {
+        // Node-RED endpoints
+        //input name:"prefNodeRedBase", type:"text", title:"Node-RED Base URL (e.g., http://192.168.1.20:1880)", required:true
+        //input name:"prefCfgPath",     type:"text", title:"Node-RED Config Path", defaultValue:"/pima/cfg", required:true
+        //input name:"prefOpPath",      type:"text", title:"Node-RED Ops Path",    defaultValue:"/pima/op", required:true
+        //input name:"prefNodeRedAuthHeader", type:"text", title:"Node-RED Auth Header (e.g., x-api-key: abc123)", required:false
+        //input name:"prefDataReqPath", type:"text", title:"Node-RED Data-REQ Path", defaultValue:"/pima/data-req", required:true
+
+        // Node-RED TCP listener for this panel
+        input name:"prefNodeRedPort", type:"number", title:"Node-RED TCP IN Port for this panel", defaultValue:5001, required:true
+
+        // Panel credentials passed to Node-RED
+        input name:"prefAccount", type:"text",     title:"PIMA Account", required:true
+        input name:"prefUserPin", type:"password", title:"User PIN", required:true
+
+        // Maker API callback info (used by Node-RED to call this device)
+        input name:"prefHubBase",     type:"text",     title:"Hubitat Base URL (e.g., http://hubitat.local)", required:true
+        input name:"prefMakerAppId",  type:"number",   title:"Maker API App ID", required:true
+        input name:"prefMakerToken",  type:"password", title:"Maker API Token", required:true
+
+        // Children
+        input name: "childPrefix", type: "text", title: "Child device name prefix", defaultValue: "PIMA Force", required: true
+		input name:"prefAutoCreateChildren", type:"bool",   title:"Auto-create zone/partition children", defaultValue:true
+        input name:"prefMaxZones",           type:"number", title:"Max zones to allow", defaultValue:144
+        input name:"prefDeleteGhostPartitions", type:"bool", title:"Delete non-existing partition children", defaultValue:true
+
+        // Display-only fields (optional)
+        //input name:"prefModel", type:"text", title:"Panel model (display)", required:false
+        //input name:"prefFw",    type:"text", title:"Panel FW (display)",    required:false
+
+        // Logging + event hygiene
+        input name:"prefDebug",     type:"bool", title:"Enable debug logging", defaultValue:true
+        input name:"prefTrace",     type:"bool", title:"Enable trace logging", defaultValue:false
+        input name:"prefSpamGuard", type:"bool", title:"Coalesce duplicate events (spam guard)", defaultValue:true
+        
+        input name: "dateFormat",   type: "enum",title: "Date format for logs and attributes", required: true, defaultValue: "SHORT",
+          options: [
+              "ISO"    : "2025-11-19 15:23:45",
+              "EU_24H" : "19/11/2025 15:23:45",
+              "US_12H" : "11/19/2025 3:23:45 PM",
+              "SHORT"  : "19-11-25 15:23"
+          ]
+        // NEW: Partition alarm cool-down
+        // Use the same value (in seconds) as the siren timeout programmed in the PIMA panel.
+        // 0 = no cool-down (partition alarm goes idle as soon as all zones restore).
+        input name:"prefAlarmCooldown", type:"number", title:"Partition alarm cool-down (seconds)", defaultValue:60, required:true
+        
+        // SUGGEST LATER: timed auto-disable of debug
+        // input name:"prefAutoDisableDebugMins", type:"number", title:"Auto-disable debug after N minutes", defaultValue:0
+    }
+}
+
+/* ============================== */
+/* ========= LIFECYCLE ========= */
+/* ============================== */
+
+def installed() {
+    logInfo("installed()")
+    sendEvent(name:"supportedOperations", value:"armStay,armAway,disarm,bypass,clearBypass,pgmOn,pgmOff,sendOperation,pollPartitions")
+    sendEvent(name:"panelStatus", value:"online")
+    sendEvent(name:"bridgeState", value:"up")
+    sendEvent(name:"nodeRedPort", value: prefNodeRedPort as Integer)
+    sendEvent(name:"systemTrouble", value:"ok")
+    state.childPrefix = (settings?.childPrefix ?: "PIMA Force")  // CHANGED: remember initial child prefix
+    runIn(2, "syncConfig")
+}
+
+def updated() {
+    logInfo("updated()")
+    //if (prefModel)   sendEvent(name:"model", value: prefModel)
+    //if (prefFw)      sendEvent(name:"fwVersion", value: prefFw)
+    if (prefAccount) sendEvent(name:"account", value: prefAccount)
+    sendEvent(name:"nodeRedPort", value: prefNodeRedPort as Integer)
+
+    String newPrefix = (settings?.childPrefix ?: "PIMA Force")          // CHANGED: current pref value
+    String oldPrefix = state.childPrefix                                // CHANGED: use stored prefix if any
+
+    if (!oldPrefix) {                                                   // CHANGED: first run with new driver
+        String inferred = _inferChildPrefixFromLabels()                 // CHANGED: try to derive prefix from existing labels
+        oldPrefix = inferred ?: newPrefix                               // CHANGED: fall back to newPrefix if nothing to infer
+        state.childPrefix = oldPrefix                                   // CHANGED: persist baseline prefix
+        logDebug("updated(): initialized childPrefix='${oldPrefix}' (inferred=${inferred != null})") // CHANGED
+    }
+
+    if (newPrefix != oldPrefix) {                                       // CHANGED: only when prefix actually changed
+        logInfo("Child prefix changed from '${oldPrefix}' to '${newPrefix}', updating child labels")
+        _applyChildPrefixToLabels(newPrefix)                            // CHANGED: rename all child labels
+        state.childPrefix = newPrefix                                   // CHANGED: persist new prefix
+    }
+
+    runIn(1, "syncConfig")
+}
+
+
+def initialize() { logTrace("initialize()") }
+def refresh()    { logTrace("refresh()")    }
+// SUGGEST REMOVE: def configure() { } (if truly unused by apps; otherwise keep for completeness)
+def configure()  { logTrace("configure()")  }
+// SUGGEST REMOVE: capability "Polling" and empty poll()
+def poll()       { logTrace("poll()")       }
+
+/* ============================================== */
+/* ===== Hubitat → Node-RED: discovery/ops ====== */
+/* ============================================== */
+
+def startDiscovery() {
+    logInfo("startDiscovery()")
+    def ts = _nowIso()
+    sendEvent(name:"discoveryState", value:"inProgress")
+    sendEvent(name:"discoveryLastTs", value:ts)
+    emitNrRequest([type:"discover"])
+}
+
+def startZoneCount() { // manual hook
+    logInfo("startZoneCount()")
+    sendEvent(name:"discoveryState", value:"inProgress")
+    emitNrRequest([type:"data-req", id:2148, start:1])
+}
+def startZoneNames() { // manual hook
+    logInfo("startZoneNames()")
+    emitNrRequest([type:"data-req", id:260,  start:1])
+}
+
+def syncConfig() {
+    logDebug("syncConfig() → emit cfg via nrRequest")
+
+    def cfg = [
+        type         : "cfg",   // <-- tells NR this is a config frame
+        nodeRedPort  : (prefNodeRedPort ?: 0) as Integer,
+        accountNumber: (prefAccount ?: "").toString(),
+        userPassword : prefUserPin,  // not logged
+        hubitat      : [
+            base : (prefHubBase ?: "").toString(),
+            appId: (prefMakerAppId ?: 0) as Integer,
+            token: prefMakerToken,   // not logged
+            parentDeviceId: device.id as Long
+        ]
+        // You can add pimaIP, panel, zones, authKey later if you want
+    ]
+
+    emitNrRequest(cfg)
+}
+
+def _cfgResp(resp, data) { logDebug("cfg response status=${resp?.status}") }
+
+def armStay(Number partition) {
+    Integer pid = _asInt(partition)
+    _rememberLastArmRequest(pid, "armStay")
+    _op("armStay", [partition: pid])
+}
+
+def armAway(Number partition) {
+    Integer pid = _asInt(partition)
+    _rememberLastArmRequest(pid, "armAway")
+    _op("armAway", [partition: pid])
+}
+
+def armNight(Number partition) {
+    Integer pid = _asInt(partition)
+    _rememberLastArmRequest(pid, "armNight")
+    _op("armNight", [partition: pid])
+}
+
+def disarm(Number partition, String pin = null) {
+    Integer pid = _asInt(partition)
+    _clearLastArmRequest(pid)
+    _op("disarm", [partition: pid, pin: (pin ?: prefUserPin)])
+}
+
+def bypassZone(Number zoneId, Number partition=null)  { _op("bypassZone",  [zoneId:zoneId, partition:partition]) }
+def clearBypass(Number zoneId, Number partition=null) { _op("clearBypass", [zoneId:zoneId, partition:partition]) }
+def pgmOn(Number pgmId, Number seconds=null)    { _op("pgmOn",       [pgmId:pgmId, seconds:seconds]) }
+def pgmOff(Number pgmId)                        { _op("pgmOff",      [pgmId:pgmId]) }
+def sendOperation(String opCode, String p1=null, String p2=null, String p3=null, String raw=null) {
+    _op("sendOperation", [opCode:opCode, p1:p1, p2:p2, p3:p3, raw:raw])
+}
+
+/* Shared operation helper: send soft OP request via nrRequest attribute */
+private _op(String op, Map extra = [:]) {
+    logDebug("op=${op}, extraKeys=${extra?.keySet()}")
+    def ts = _nowIso()
+    sendEvent(name:"lastOperation",       value: op)
+    sendEvent(name:"lastOperationTs",     value: ts)
+    sendEvent(name:"lastOperationResult", value: "ok")
+
+    // Soft request for Node-RED (consumed via Maker API + Hubitat palette)
+    Map payload = [type: "op", cmd: op] + (extra ?: [:])
+    emitNrRequest(payload)
+}
+
+def _nrResp(resp, data) { logDebug("op response status=${resp?.status}") }
+
+/* Emit a "soft command" to Node-RED by writing attributes. */
+private void emitNrRequest(Map m) {
+    Integer c = (device.currentValue("nrReqCtr") as Integer ?: 0) + 1
+    def payload = (m + [ctr:c, ts:_nowIso()])
+    logTrace("emitNrRequest ${payload}")
+    sendEvent(name:"nrReqCtr", value:c)
+    sendEvent(name:"nrRequest", value: JsonOutput.toJson(payload), isStateChange:true)
+}
+
+/* ============================================== */
+/* ===== Node-RED → Hubitat: inbound handler ==== */
+/* ============================================== */
+
+def processData(String json) {
+    if (!json) return
+    logTrace("processData START len=${json?.size()}")
+    def obj
+    try { obj = new JsonSlurper().parseText(json) }
+    catch (e) { logWarn("Invalid JSON: ${e}"); return }
+    if (!(obj instanceof Map)) { logWarn("JSON root not an object"); return }
+
+    def kind = (obj.kind ?: "").toString()
+    switch(kind) {
+        case "panel":
+            _applyPanel(obj)
+            break
+        case "zone":
+            _applyZone(obj)
+            break
+        case "partition":
+            _applyPartition(obj)
+            break
+        case "bulk":
+            if (obj.panel instanceof Map) _applyPanel(obj.panel as Map)
+            (obj.zones ?: []).each { z -> if (z instanceof Map) _applyZone(z as Map) }
+            (obj.partitions ?: []).each { p -> if (p instanceof Map) _applyPartition(p as Map) }
+            break
+        default:
+            logWarn("Unknown kind: ${kind}")
+    }
+    logTrace("processData END kind=${kind}")
+}
+
+import groovy.json.JsonSlurper
+
+// =======================
+// PIMA EVENT ENTRY POINT
+// =======================
+
+command "pimaEvent", [[
+    name: "eventJson",
+    type: "STRING",
+    description: "PIMA EVENT frame as JSON"
+]]
+
+def pimaEvent(String eventJson) {
+    logDebug "pimaEvent() raw: ${eventJson}"
+    try {
+        def evt = new JsonSlurper().parseText(eventJson)
+        handlePimaEvent(evt)
+    } catch (Exception e) {
+        logWarn "Failed to parse PIMA event JSON: ${e} - raw: ${eventJson}"
+    }
+}
+
+// =======================
+// PIMA EVENT ROUTER
+// =======================
+
+private void handlePimaEvent(Map evt) {
+    Integer type = (evt.type ?: 0) as Integer
+    Integer qual = (evt.qualifier ?: 0) as Integer
+    Integer zone = (evt.zone ?: 0) as Integer      // reused as "user index" or keyswitch zone for some types
+    Integer part = (evt.partition ?: 0) as Integer
+
+    logDebug "handlePimaEvent() type=${type} qual=${qual} zone=${zone} part=${part}"
+
+    switch(type) {
+        // ----- ZONE EVENTS -----
+        case 760:
+            handleZoneOpenCloseEvent(zone, part, qual)
+            break
+		// -------OUTPUT EVENTS (SIRENS)---------
+		case 770:
+    		handleOutputEvent(zone, part, qual, evt)
+   			break
+        case 130:
+            handleZoneIntrusionAlarm(zone, part, qual, evt)
+            break
+
+        // ----- PARTITION ARM/DISARM EVENTS -----
+        case 400:  // keypad master
+        case 401:  // user/remote
+        case 403:  // auto
+        case 407:  // remote
+        case 408:  // fast
+        case 409:  // keyswitch
+        case 441:  // home/shabbat arming
+            handlePartitionArmEvent(type, qual, zone, part, evt)
+            break
+
+        // ----- SYSTEM MAJOR EVENTS (POWER / COMM / TAMPER / JAMMING / EXPANDER) -----
+        case 301:  // AC fail / restore
+        case 302:  // battery low / restore
+        case 305:  // system power-up
+        case 312:  // aux power fault / restore
+        case 350:  // comm trouble / restore
+        case 351:  // line / GSM / network faults / restore
+        case 145:  // panel/expander/keypad tamper / restore
+        case 321:  // siren 1 / wireless external siren trouble / restore
+        case 322:  // siren 2 / wireless internal siren trouble / restore
+        case 344:  // wireless jamming / restore
+        case 342:  // expander AC fail / restore
+            handleSystemMajorEvent(type, qual, evt)
+            break
+
+        // ----- OTHER EVENT TYPES (ignored for now) -----
+        default:
+            logDebug "Unhandled PIMA event type=${type}, qualifier=${qual}, zone=${zone}, partition=${part}"
+            break
+    }
+}
+
+// =======================
+// SYSTEM MAJOR EVENTS
+// =======================
+
+private void handleSystemMajorEvent(Integer type, Integer qual, Map evt) {
+    boolean isRestore = (qual == 3)
+    String code = "${type}-${qual}"
+    String ts   = _nowIso()
+
+    String msg
+
+    switch(type) {
+        case 301: // AC fail / restore
+            msg = isRestore ? "AC power restored" : "AC power failure"
+            // We already have acPower attribute: ok|fail
+            sendEvent(name:"acPower", value: isRestore ? "ok" : "fail")
+            break
+
+        case 302: // panel battery low / restore
+            msg = isRestore ? "Panel battery restored" : "Panel battery low"
+            // We let DATA-REQ update battery %, we just log + flag trouble
+            break
+
+        case 305: // system power-up
+            msg = "System power-up"
+            // Do NOT toggle systemTrouble here, just record and exit
+            sendEvent(name:"lastPanelEvent",   value:"${code}:${msg}")
+            sendEvent(name:"lastPanelEventTs", value:ts)
+            logInfo("${msg} (${code}) evt=${evt}")
+            return
+
+        case 312: // aux power fault / restore
+            msg = isRestore ? "Aux power restored" : "Aux power failure"
+            break
+
+        case 350: // communication trouble / restore
+            msg = isRestore ? "Communication restored" : "Communication trouble"
+            break
+
+        case 351: // line / GSM / SIM / network faults
+            msg = isRestore ? "Line/GSM/network restored" : "Line/GSM/network failure"
+            break
+
+        case 145: // panel/expander/keypad tamper
+            msg = isRestore ? "Module tamper restored" : "Module tamper detected"
+            break
+
+        case 321: // siren 1 / wireless external siren trouble
+            msg = isRestore ? "Siren 1 / wireless external siren restored" : "Siren 1 / wireless external siren trouble"
+            break
+
+        case 322: // siren 2 / wireless internal siren trouble
+            msg = isRestore ? "Siren 2 / wireless internal siren restored" : "Siren 2 / wireless internal siren trouble"
+            break
+
+        case 344: // wireless jamming
+            msg = isRestore ? "Wireless jamming cleared" : "Wireless jamming detected"
+            break
+
+        case 342: // expander AC fail / restore
+            msg = isRestore ? "Expander AC restored" : "Expander AC failure"
+            break
+
+        default:
+            msg = "System event"
+            break
+    }
+
+    // Optional: simple global flag for rules (ok / trouble)
+    if (device.hasAttribute("systemTrouble")) {
+        sendEvent(name:"systemTrouble", value: isRestore ? "ok" : "trouble")
+    }
+
+    // Record last panel-level event (you already expose these)
+    sendEvent(name:"lastPanelEvent",   value:"${code}:${msg}")
+    sendEvent(name:"lastPanelEventTs", value:ts)
+
+    if (isRestore) {
+        logInfo("${msg} (${code}) evt=${evt}")
+    } else {
+        logWarn("TROUBLE: ${msg} (${code}) evt=${evt}")
+    }
+}
+
+
+
+// =======================
+// ZONE EVENTS
+// =======================
+// =======================
+// ZONE OPEN/CLOSE (type 760)
+// =======================
+
+private void handleZoneOpenCloseEvent(Integer zone, Integer part, Integer qual) {
+    if (!zone) {
+        logWarn "760 event with no zone (partition ${part}, qualifier ${qual})"
+        return
+    }
+
+    def child = findZoneChild(zone, part)
+    if (!child) {
+        logWarn "Zone event 760 for zone ${zone}, part ${part} but no matching zone child found"
+        return
+    }
+
+    String newContact
+    String newZoneState
+
+    if (qual == 1) {
+        newContact   = "open"
+        newZoneState = "open"
+    } else if (qual == 3) {
+        newContact   = "closed"
+        newZoneState = "restored"
+    } else {
+        logWarn "760 event with unexpected qualifier ${qual} for zone ${zone}, part ${part}"
+        return
+    }
+
+    String zoneName = child?.displayName ?: child?.label ?: "Zone ${zone}"
+
+    logInfo  "${zoneName} is now ${newContact}"
+    logDebug "Zone ${zone} / Partition ${part} → ${newContact} (qual=${qual})"
+
+    // NEW: update lastEvent / lastEventTs on the zone child
+    String codeStr = "760-${qual}-${zone}"
+    String ts      = fmtTs()
+
+    child.sendEvent(
+        name: "lastEvent",
+        value: codeStr,
+        descriptionText: "PIMA event ${codeStr} (${newContact})"
+    )
+    child.sendEvent(
+        name: "lastEventTs",
+        value: ts,
+        descriptionText: "Last zone event at ${ts}"
+    )
+
+    child.notifyZoneOpenCloseEvent(newContact, newZoneState, qual, part)
+}
+
+// =======================
+// OUTPU ZONE EVENT (SIRENS) (type 770)
+// =======================
+
+private void handleOutputEvent(Integer outputId, Integer part, Integer qual, Map evt) {
+    if (!outputId) {
+        logWarn "770 event with no outputId (partition ${part}, qualifier ${qual})"
+        return
+    }
+
+    // Siren ON/OFF
+    boolean isOn  = (qual == 1)
+    boolean isOff = (qual == 3)
+
+    if (!isOn && !isOff) {
+        logWarn "770 unexpected qualifier ${qual} for output ${outputId}"
+        return
+    }
+
+    String newState = isOn ? "on" : "off"
+
+    // ---------------------------
+    // ONLY outputs 1 and 2 are actual sirens
+    // ---------------------------
+    if (outputId == 1) {
+        updateSirenChild("ext", newState, evt)
+        return
+    }
+    if (outputId == 2) {
+        updateSirenChild("int", newState, evt)
+        return
+    }
+
+    // All other outputs → debug-log only
+    logDebug "Ignoring non-siren output ${outputId} → ${newState} (770)"
+}
+
+private void updateSirenChild(String role, String state, Map evt) {
+    String dni = "${device.deviceNetworkId}-siren-${role}"
+    def child = getChildDevice(dni)
+    if (!child) {
+        logWarn("Siren child '${role}' not found for 770 event")
+        return
+    }
+
+    String ts = fmtTs()
+    String codeStr = "770-${state}"
+
+    // Use the child API to keep switch+alarm in sync
+    try {
+        child.updateStateFromParent(state)
+    } catch (Exception e) {
+        logWarn("updateStateFromParent(${state}) failed for ${dni}: ${e}")
+        // fallback: direct switch event if needed
+        child.sendEvent(name:"switch", value: state)
+    }
+
+    child.sendEvent(name:"lastEvent",   value: codeStr, descriptionText: "PIMA 770 siren ${state}")
+    child.sendEvent(name:"lastEventTs", value: ts)
+
+    logInfo("Siren (${role}) is now ${state}")
+}
+
+
+// =======================
+// ZONE INTRUSION ALARM (type 130)
+// =======================
+
+private void handleZoneIntrusionAlarm(Integer zone, Integer part, Integer qual, Map evt) {
+    if (!zone) {
+        logWarn "130 event with no zone (partition ${part}, qualifier ${qual})"
+        return
+    }
+
+    def child = findZoneChild(zone, part)
+    if (!child) {
+        logWarn "130 intrusion alarm for zone ${zone}, part ${part} but no matching zone child found"
+        return
+    }
+
+    String codeStr = "130-${qual}-${zone}"
+	String ts = fmtTs()
+
+    // Keep these meta attributes on the child
+    child.sendEvent(name: "lastEvent",   value: codeStr, descriptionText: "PIMA event ${codeStr}")
+    child.sendEvent(name: "lastEventTs", value: ts)
+    child.sendEvent(name: "rawCode",     value: groovy.json.JsonOutput.toJson(evt))
+
+    String alarmStateVal
+    String zoneStateVal
+
+    if (qual == 1) {
+        // 130-1-N = intrusion alarm active
+        alarmStateVal = "alarm"
+        zoneStateVal  = "violated"
+        logInfo "Zone ${zone} (P${part}) intrusion alarm"
+    } else if (qual == 3) {
+        // 130-3-N = alarm restore
+        alarmStateVal = "idle"
+        zoneStateVal  = "restored"   // or "normal"
+        logInfo "Zone ${zone} (P${part}) alarm restored"
+    } else {
+        logWarn "130 intrusion alarm with unexpected qualifier ${qual} for zone ${zone}, part ${part}"
+        return
+    }
+
+        // Always delegate to child – this is where child logging happens
+    child.notifyZoneIntrusionEvent(alarmStateVal, zoneStateVal, qual, part, codeStr)
+
+    // NEW: update partition-level alarm incident (per partition)
+    _updatePartitionAlarmFromZone(part, zone, (qual == 1))
+}
+
+// =======================
+// PARTITION ALARM INCIDENTS (driven by zone 130 events)
+// =======================
+
+private void _updatePartitionAlarmFromZone(Integer part, Integer zone, boolean alarmOn) {
+    if (!part || !zone) {
+        logDebug "_updatePartitionAlarmFromZone(): missing part or zone (part=${part}, zone=${zone}, alarmOn=${alarmOn})"
+        return
+    }
+
+    // state.partAlarms structure:
+    // state.partAlarms = [
+    //   "1": [ zones: [2,5], incidentCtr:1, clearToken: 3 ],
+    //   "2": [ zones: [],    incidentCtr:0, clearToken: null ]
+    // ]
+    Map pa = (state.partAlarms instanceof Map) ? (Map) state.partAlarms : [:]
+    String key = part.toString()
+    Map rec = (pa[key] instanceof Map) ? (Map) pa[key] : [:]
+
+    List<Integer> zones = []
+    if (rec.zones instanceof Collection) {
+        zones = rec.zones.collect { (it as Integer) }
+    }
+
+    boolean beforeEmpty = zones.isEmpty()
+
+    if (alarmOn) {
+        if (!zones.contains(zone)) {
+            zones << (zone as Integer)
+        }
+        rec.zones = zones
+
+        // New incident starts when we go from "no zones in alarm" → "at least one zone in alarm"
+        if (beforeEmpty) {
+            Integer ctr = (rec.incidentCtr instanceof Number) ? (rec.incidentCtr as Integer) : 0
+            ctr++
+            rec.incidentCtr = ctr
+            rec.clearToken  = null   // any pending clear is cancelled
+
+            def child = findPartitionChild(part)
+            if (child) {
+                String cur = (child.currentValue("alarm") ?: "").toString()
+                if (cur != "alarm") {
+                    child.sendEvent(
+                        name: "alarm",
+                        value: "alarm",
+                        descriptionText: "Partition ${part} alarm active (zones ${zones})"
+                    )
+                    logInfo "Partition ${part} alarm active (zones ${zones})"
+                } else {
+                    logDebug "Partition ${part} alarm already 'alarm', suppressing duplicate"
+                }
+            } else {
+                logWarn "_updatePartitionAlarmFromZone(): no partition child for part=${part} (alarmOn)"
+            }
+        } else {
+            // Already in an incident, just add zone to list
+            rec.clearToken = null  // cannot clear while active
+            logDebug "Partition ${part} alarm incident extended; zones=${zones}"
+        }
+    } else {
+        // alarmOff for this zone
+        zones = zones.findAll { it != (zone as Integer) }
+        rec.zones = zones
+
+        if (!zones.isEmpty()) {
+            // Still at least one zone in alarm → keep partition alarm as 'alarm'
+            logDebug "Partition ${part} alarm still active; remaining zones=${zones}"
+        } else {
+            // All zones restored. Decide based on cool-down.
+            Integer cd = _alarmCooldownSecs()
+            def child = findPartitionChild(part)
+
+            if (cd <= 0) {
+                // No cool-down: clear immediately
+                rec.clearToken = null
+                if (child) {
+                    String cur = (child.currentValue("alarm") ?: "").toString()
+                    if (cur != "idle") {
+                        child.sendEvent(
+                            name: "alarm",
+                            value: "idle",
+                            descriptionText: "Partition ${part} alarm cleared (no zones in alarm)"
+                        )
+                        logInfo "Partition ${part} alarm cleared"
+                    } else {
+                        logDebug "Partition ${part} alarm already 'idle', suppressing duplicate"
+                    }
+                } else {
+                    logWarn "_updatePartitionAlarmFromZone(): no partition child for part=${part} (clearing immediately)"
+                }
+            } else {
+                // Cool-down: keep alarm=alarm for cd seconds, then clear if no new alarms
+                Long token = (rec.clearToken instanceof Number) ? ((rec.clearToken as Long) + 1L) : 1L
+                rec.clearToken = token
+                logInfo "Partition ${part} alarm cleared – cool-down started (${cooldown}s)"
+                // Schedule a global check – it will look at state.partAlarms and only clear if still valid.
+                runIn(cd, "partitionAlarmCooldownCheck")
+            }
+        }
+    }
+
+    pa[key] = rec
+    state.partAlarms = pa
+}
+
+private void partitionAlarmCooldownCheck() {
+    Map pa = (state.partAlarms instanceof Map) ? (Map) state.partAlarms : [:]
+    if (!pa) return
+
+    pa.keySet().each { String key ->
+        Map rec = (pa[key] instanceof Map) ? (Map) pa[key] : null
+        if (!rec) return
+
+        Integer part = key.isInteger() ? key.toInteger() : null
+        if (!part) return
+
+        List<Integer> zones = []
+        if (rec.zones instanceof Collection) {
+            zones = rec.zones.collect { (it as Integer) }
+        }
+
+        def token = rec.clearToken
+        if (token == null) {
+            // No pending clear for this partition
+            return
+        }
+
+        if (!zones.isEmpty()) {
+            // New alarm(s) came in during cool-down → do NOT clear, just keep token for debugging or reset it
+            logDebug "partitionAlarmCooldownCheck(): part=${part} still has zones in alarm (${zones}), skipping clear"
+            return
+        }
+
+        // All zones are clear and a cool-down was pending → clear alarm now
+        def child = findPartitionChild(part)
+        if (child) {
+            String cur = (child.currentValue("alarm") ?: "").toString()
+            if (cur != "idle") {
+                child.sendEvent(
+                    name: "alarm",
+                    value: "idle",
+                    descriptionText: "Partition ${part} alarm cleared after cool-down"
+                )
+                logInfo "Partition ${part} alarm cleared after cool-down"
+            } else {
+                logDebug "partitionAlarmCooldownCheck(): part=${part} alarm already 'idle', suppressing duplicate"
+            }
+        } else {
+            logWarn "partitionAlarmCooldownCheck(): no partition child for part=${part} (cool-down clear)"
+        }
+
+        // Reset clearToken now that we've cleared
+        rec.clearToken = null
+        pa[key] = rec
+    }
+
+    state.partAlarms = pa
+}
+
+
+// =======================
+// PARTITION ARM/DISARM (400,401,403,407,408,409,441)
+// =======================
+
+private void handlePartitionArmEvent(Integer type, Integer qual, Integer zoneField, Integer part, Map evt) {
+    logDebug "handlePartitionArmEvent ENTER type=${type}, qual=${qual}, zoneField=${zoneField}, part=${part}, evt=${evt}"
+
+    if (!part) {
+        logWarn "Partition arm event type=${type} with no partition (qual=${qual})"
+        return
+    }
+
+    def child = findPartitionChild(part)
+    if (!child) {
+        logWarn "Partition arm event type=${type} for part=${part} but no partition child found"
+        return
+    }
+
+    logDebug "handlePartitionArmEvent using child=${child.displayName}, dni=${child.deviceNetworkId}"
+
+    // -----------------
+    // Determine target mode
+    // -----------------
+    String requested = null
+
+    if (state.lastArmReq instanceof Map) {
+        Map m = (Map) state.lastArmReq
+        String key = part?.toString()
+        requested = m[key]
+        logDebug("handlePartitionArmEvent: part=${part}, key=${key}, requested=${requested}, keys=${m.keySet()}")
+    }
+
+    String newMode
+
+    if (qual == 1) {
+        newMode = "disarmed"
+    }
+    else if (qual == 3) {
+
+        // use remembered op when present
+        switch(requested) {
+            case "armStay":
+            case "armHome":
+                newMode = "armedStay"
+                break
+
+            case "armNight":
+                newMode = "armedNight"
+                break
+
+            case "armAway":
+                newMode = "armedAway"
+                break
+
+            default:
+                // fallback – PIMA raw type 441 is Shabbat
+                newMode = (type == 441) ? "shabbatOn" : "armedAway"
+                break
+        }
+    }
+    else {
+        logWarn "Unexpected qual=${qual} for partition ${part}"
+        return
+    }
+
+    // -----------------
+    // Determine source + optional user text
+    // -----------------
+    String source
+    String userText = ""
+
+    switch(type) {
+        case 400:
+            source = "keypadMaster"
+            break
+        case 401:
+            source = "userCode"
+            if (zoneField > 0) userText = "user=${zoneField}"
+            break
+        case 403:
+            source = "auto"
+            break
+        case 407:
+            source = "remote"
+            if (zoneField > 0) userText = "user=${zoneField}"
+            break
+        case 408:
+            source = "fast"
+            break
+        case 409:
+            source = "keyswitch"
+            if (zoneField > 0) userText = "keyswitchZone=${zoneField}"
+            break
+        case 441:
+            source = "homeShabbat"
+            if (zoneField > 0) userText = "user=${zoneField}"
+            break
+        default:
+            source = "unknown"
+            break
+    }
+
+    // -----------------
+    // Build lastEvent + ts
+    // -----------------
+    String codeStr = "${type}-${qual}-${zoneField}"
+	String detail  = "${newMode} via ${source}"
+	if (userText) detail += " (${userText})"
+
+	String ts = fmtTs()
+
+    logDebug "handlePartitionArmEvent resolved newMode=${newMode}, detail='${detail}', codeStr=${codeStr}, ts=${ts}"
+	// NEW: always update lastEvent / lastEventTs on partition child
+	child.sendEvent(
+    	name: "lastEvent",
+    	value: "${codeStr}:${detail}",
+   	 descriptionText: "PIMA event ${codeStr} (${detail})"
+	)
+	child.sendEvent(
+ 	   name: "lastEventTs",
+  	  value: ts,
+  	  descriptionText: "Last partition event at ${ts}"
+	)
+
+    // -----------------
+    // Send events to partition child
+    // -----------------
+    logDebug "Partition arm dispatch (TRY): child='${child.displayName}', " + "newMode=${newMode}"//, codeStr=${codeStr}"
+
+    boolean handled = false
+
+    // 1) Try new API: notifyPartitionArmEvent(...)
+    try {
+        logDebug "Attempting ${child.displayName}.notifyPartitionArmEvent(...)"
+        child.notifyPartitionArmEvent(
+            newMode,
+            type,
+            qual,
+            zoneField,
+            part,
+            detail,
+            codeStr,
+            ts
+        )
+        handled = true
+        logDebug "notifyPartitionArmEvent() completed on ${child.displayName}"
+    } catch (MissingMethodException e) {
+        logWarn "Child ${child.displayName} has no notifyPartitionArmEvent(): ${e}"
+    } catch (Exception e) {
+        logWarn "Error calling notifyPartitionArmEvent on ${child.displayName}: ${e}"
+    }
+
+    // 2) If not handled, try older API: notifyModeChange(...)
+    if (!handled) {
+        try {
+            logInfo "Attempting ${child.displayName}.notifyModeChange(...) fallback"
+            child.notifyModeChange(newMode, detail, codeStr, ts)
+            handled = true
+            logInfo "notifyModeChange() fallback completed on ${child.displayName}"
+        } catch (MissingMethodException e) {
+            logWarn "Child ${child.displayName} has no notifyModeChange(): ${e}"
+        } catch (Exception e) {
+            logWarn "Error calling notifyModeChange on ${child.displayName}: ${e}"
+        }
+    }
+
+    // 3) If still not handled, use direct sendEvent fallback
+    if (!handled) {
+        logInfo "Using direct sendEvent fallback for partition ${part}"
+        child.sendEvent(
+            name: "mode",
+            value: newMode,
+            descriptionText: "Partition ${part} mode -> ${newMode} (${detail})"
+        )
+        child.sendEvent(name: "lastEvent",   value: "${codeStr}:${detail}")
+        child.sendEvent(name: "lastEventTs", value: ts)
+    }
+
+    logInfo "Partition ${part} mode=${newMode} via ${source} "// + "(type=${type}, qual=${qual}, zoneField=${zoneField}, ${userText})"
+}
+
+
+// ===============================
+// SIREN CONTROL FROM CHILD DEVICES
+// ===============================
+
+// Called by "PIMA Force Siren" child on on()
+def sirenOn(String dni) {
+    def child = getChildDevice(dni)
+    if (!child) {
+        logWarn("sirenOn(): child ${dni} not found")
+        return
+    }
+
+    Integer order = _asInt(child.getDataValue("pimaOrder"))
+    if (!order) {
+        logWarn("sirenOn(): missing or invalid pimaOrder for ${dni}")
+        return
+    }
+
+    String ts = fmtTs()
+    child.sendEvent(name: "lastEvent",   value: "sirenOn",  descriptionText: "Siren ON at ${ts}")
+    child.sendEvent(name: "lastEventTs", value: ts)
+
+    logInfo("Siren ON → ${child.displayName} (order=${order})")
+    emitNrRequest([type:"op", cmd:"output_on", order:order])
+
+    // NEW: push state to child
+    try {
+        child.updateStateFromParent("on")
+    } catch (Exception e) {
+        logWarn("sirenOn(): failed to update child state for ${dni}: ${e}")
+    }
+}
+
+def sirenOff(String dni) {
+    def child = getChildDevice(dni)
+    if (!child) {
+        logWarn("sirenOff(): child ${dni} not found")
+        return
+    }
+
+    Integer order = _asInt(child.getDataValue("pimaOrder"))
+    if (!order) {
+        logWarn("sirenOff(): missing or invalid pimaOrder for ${dni}")
+        return
+    }
+
+    String ts = fmtTs()
+    child.sendEvent(name: "lastEvent",   value: "sirenOff", descriptionText: "Siren OFF at ${ts}")
+    child.sendEvent(name: "lastEventTs", value: ts)
+
+    logInfo("Siren OFF → ${child.displayName} (order=${order})")
+    emitNrRequest([type:"op", cmd:"output_off", order:order])
+
+    // NEW: push state to child
+    try {
+        child.updateStateFromParent("off")
+    } catch (Exception e) {
+        logWarn("sirenOff(): failed to update child state for ${dni}: ${e}")
+    }
+}
+
+/* ================================================= */
+/* ===== Partition helpers & reconciliation ======== */
+/* ================================================= */
+
+// Kept for compatibility as you iterate.
+private void _syncPartitions(List parts) {
+    final String parentDni = device.deviceNetworkId
+    final Set<String> wanted = [] as Set
+
+    parts?.each { Map p ->
+        Integer pid  = (p.partitionId ?: 0) as Integer
+        Integer code = (p.code ?: 0) as Integer
+        if (pid <= 0) return
+
+        final String dni = "${parentDni}-P${pid}"
+
+        if (code == 1) { // NotExist → delete or mark
+            def ghost = getChildDevice(dni)
+            if (ghost) {
+                try {
+                    deleteChildDevice(dni)
+                    logInfo("Deleted ghost partition child ${pid}")
+                } catch (e) {
+                    logWarn("Failed to delete ghost child ${pid}: ${e}")
+                    try { ghost.sendEvent(name:"exists", value:false) } catch(ignored) {}
+                }
+            }
+            return
+        }
+
+        def ch = getChildDevice(dni)
+        if (!ch) {
+            try {
+                ch = addChildDevice(_ns(), CHILD_TYPE_PART, dni,
+                    [label: "${device.displayName} P${pid}", isComponent: true, name: "Partition ${pid}"])
+                logInfo("Created partition child ${pid}")
+            } catch (e) {
+                logWarn("Failed to create partition child ${pid}: ${e}")
+                return
+            }
+        }
+        wanted << dni
+
+        String mode =
+            (code==2) ? "disarmed"  :
+            (code==3) ? "armedAway" :
+            (code==4) ? "home1"     :
+            (code==5) ? "home2"     :
+            (code==6) ? "home3"     :
+            (code==7) ? "home4"     :
+            (code==8) ? "shabbatOn" :
+            (code==9) ? "shabbatOff": "unknown"
+
+        try {
+            ch.sendEvent(name:"partitionId", value: pid)
+            ch.sendEvent(name:"mode",        value: mode)
+            ch.sendEvent(name:"exists",      value: true)
+            ch.sendEvent(name:"ready",       value: "notReady")
+            ch.sendEvent(name:"alarm",       value: "idle")
+            ch.sendEvent(name:"trouble",     value: "ok")
+            ch.sendEvent(name:"bypassedCount", value: 0)
+        } catch (e) {
+            logWarn("Failed to update child ${pid}: ${e}")
+        }
+    }
+
+    getChildDevices()?.findAll { d ->
+        d.deviceNetworkId?.startsWith("${parentDni}-P") && !wanted.contains(d.deviceNetworkId)
+    }?.each { d ->
+        try {
+            deleteChildDevice(d.deviceNetworkId)
+            logInfo("Deleted stale partition child ${d.deviceNetworkId}")
+        } catch (e) {
+            logWarn("Failed to delete stale partition child ${d.deviceNetworkId}: ${e}")
+            try { d.sendEvent(name:"exists", value:false) } catch(ignored) {}
+        }
+    }
+}
+
+private String _childDniForPartition(Integer pid) { "${device.deviceNetworkId}-P${pid}" }
+
+// Reconciles partition children to the set of existing partition IDs.
+private void _reconcilePartitionChildren(List<Integer> keepIds) {
+    Set<Integer> keep = (keepIds ?: []) as Set
+    List ch = getChildDevices() ?: []
+
+    ch.each { cd ->
+        def m = (cd.deviceNetworkId =~ /.*-P(\d+)$/)
+        if (!m.matches()) return
+
+        Integer pid = (m[0][1] as String)?.toInteger()
+        if (!keep.contains(pid)) {
+            try {
+                if (settings?.prefDeleteGhostPartitions) {
+                    deleteChildDevice(cd.deviceNetworkId)
+                    logInfo("Deleted ghost partition child DNI=${cd.deviceNetworkId} (pid=${pid})")
+                } else {
+                    cd.sendEvent(name:"exists", value:"false")
+                    cd.sendEvent(name:"mode",   value:"unknown")
+                    cd.sendEvent(name:"ready",  value:"notReady")
+                    logInfo("Marked ghost partition child pid=${pid} as unavailable")
+                }
+            } catch (e) {
+                logWarn("Failed to remove ghost child pid=${pid} (${cd.deviceNetworkId}): ${e}")
+            }
+        }
+    }
+}
+
+/* ================================================= */
+/* ===== Child creation (zones & partitions) ======= */
+/* ================================================= */
+
+private def _ensurePartitionChild(Integer pid) {
+    if (!pid) return null
+    String dni = _childDniForPartition(pid)
+    def child = getChildDevice(dni)
+    if (child) return child
+    try {
+        String prefix = (settings?.childPrefix ?: "PIMA Force")  // CHANGED: use user prefix for partition label
+        Map opts = [
+            isComponent: true,
+            name       : "PIMA Force Partition ${pid}",           // CHANGED: keep internal name stable
+            label      : "${prefix} Partition #${pid}"            // CHANGED: prefix-based label
+        ]
+        return addChildDevice(_ns(), _childTypePart(), dni, opts)
+    } catch (e) {
+        logWarn("Failed to create partition child ${pid}: ${e}")
+        return null
+    }
+}
+
+/* Zone child */
+private _getOrCreateChild(Integer zoneId, String zoneName=null) {
+    def dni = "${device.id}-Z${zoneId}"
+    def child = getChildDevice(dni)
+    if (child) {
+        if (!child.getDataValue("zoneId")) {                      // CHANGED: backfill zoneId dataValue on existing child
+            child.updateDataValue("zoneId", "${zoneId}")          // CHANGED
+        }
+        return child
+    }
+    if (!prefAutoCreateChildren) return null
+    if (prefMaxZones && zoneId > (prefMaxZones as Integer)) {
+        logWarn("Zone ${zoneId} > prefMaxZones (${prefMaxZones}), not creating"); return null
+    }
+    String prefix = (settings?.childPrefix ?: "PIMA Force")       // CHANGED: use user prefix for zone label
+    def label = "${prefix} Zone #${zoneId}" + (zoneName ? " (${zoneName})" : "")  // CHANGED
+    try {
+        child = addChildDevice(_ns(), "PIMA Force Zone", dni,
+            [label: label, isComponent: true, name: "PIMA Force Zone"])
+        child?.sendEvent(name:"zoneId", value: zoneId)
+        child?.updateDataValue("zoneId", "${zoneId}")             // CHANGED: store zoneId as dataValue for fast lookup
+        if (zoneName) child?.sendEvent(name:"zoneName", value: zoneName)
+        return child
+    } catch (e) {
+        logWarn("addChildDevice failed for zone ${zoneId}: ${e}"); return null
+    }
+}
+
+// ---------- SIREN CHILD MANAGEMENT ----------
+
+private childSirenEnsure(String role, String labelSuffix, int order) {
+    // role: "ext" or "int"
+    String dni = "${device.deviceNetworkId}-siren-${role}"
+    def child = getChildDevice(dni)
+    if (!child) {
+        String prefix = (settings?.childPrefix ?: "PIMA Force")   // CHANGED: use user prefix for siren labels
+        String childLabel = "${prefix} ${labelSuffix}"            // CHANGED
+        logInfo("Creating PIMA siren child: ${childLabel} (order=${order})")
+        child = addChildDevice(
+            "amithalp",             // namespace
+            "PIMA Force Siren",     // child driver name
+            dni,
+            [label: childLabel, isComponent: true]
+        )
+        child.updateDataValue("pimaOrder", order.toString())
+    } else {
+        // keep mapping in sync
+        child.updateDataValue("pimaOrder", order.toString())
+    }
+    return child
+}
+
+/* ============================================ */
+/* ===== Apply payloads to attributes/children */
+/* ============================================ */
+
+private void _applyPanel(Map m) {
+    if (!(m instanceof Map)) return
+    logTrace("_applyPanel START keys=${m?.keySet()}")
+
+    // Scalars
+    _setIf(m, "panelStatus")
+    _setIf(m, "panelMode")
+    _setIf(m, "alarmState")
+    _setIf(m, "trouble")
+    _setIf(m, "acPower")
+    //_setIf(m, "model")
+    //_setIf(m, "fwVersion")
+    _setIf(m, "account")
+    //_setIf(m, "moreData")
+    _setIf(m, "linkState")
+    _setIf(m, "bridgeState")
+
+    // heartbeatTs comes from Node-RED as ISO; normalize to user-selected format
+    if (m.containsKey("heartbeatTs")) {
+        String raw = m.heartbeatTs?.toString()
+        Long ms = _parseIsoUtcToMillis(raw)
+        String formatted = (ms != null) ? fmtTs(ms) : raw   // fallback to raw if parse fails
+        sendEvent(name:"heartbeatTs", value: formatted)
+    }
+    
+    if (m.containsKey("battery"))         sendEvent(name:"battery",         value: (m.battery as Integer))
+    //if (m.containsKey("rssi"))            sendEvent(name:"rssi",            value: (m.rssi as Integer))
+    if (m.containsKey("zones"))           sendEvent(name:"zones",           value: (m.zones as Integer))
+    if (m.containsKey("protocolCounter")) sendEvent(name:"protocolCounter", value: (m.protocolCounter as Integer))
+
+    // Event markers
+    if (m.ts) {
+        String rawTs = m.ts.toString()
+        Long msTs = _parseIsoUtcToMillis(rawTs)
+        String formattedTs = (msTs != null) ? fmtTs(msTs) : rawTs
+        sendEvent(name:"lastPanelEventTs", value: formattedTs)
+    }
+    if (m.lastPanelEvent) sendEvent(name:"lastPanelEvent",   value: m.lastPanelEvent.toString())
+    
+    // Structured: zoneStatus
+    if (m.zoneStatus instanceof Map && (m.zoneStatus.activeZones instanceof Collection)) {
+        _setIfJson([zoneStatus: m.zoneStatus], "zoneStatus")
+        state.zoneStatus = m.zoneStatus
+    }
+
+    // Structured: faults
+    if (m.containsKey("faults")) {
+        _setIfJson(m, "faults")
+        state.faults = m.faults
+    }
+
+    // Structured: users
+    if (m.containsKey("users")) {
+        _setIfJson(m, "users")
+        state.users = m.users
+    }
+
+    // Structured: bypassedZones
+    if (m.containsKey("bypassedZones")) {
+        _setIfJson(m, "bypassedZones")
+        Integer count = (m.bypassedZones instanceof Collection) ? (m.bypassedZones.size() as Integer) : 0
+        if (!prefSpamGuard || device.currentValue("bypassedCount")?.toString() != count.toString()) {
+            sendEvent(name:"bypassedCount", value: count)
+        }
+        state.bypassedZones = m.bypassedZones
+    }
+
+    // Structured: partitions (from DATA-REQ 2310)
+    if (m.partitions instanceof Collection) {
+        List<Map> all = (m.partitions as Collection)
+            .findAll { it instanceof Map }
+            .collect { Map p -> [
+                partitionId: (p.partitionId ?: 0) as Integer,
+                code       : (p.code ?: 0) as Integer,
+                label      : (p.label ?: "Unknown").toString()
+            ] }
+            .findAll { it.partitionId > 0 }
+
+        String jsonAll = JsonOutput.toJson(all)
+        if (!prefSpamGuard || device.currentValue("partitions")?.toString() != jsonAll) {
+            sendEvent(name:"partitions", value: jsonAll)
+        }
+        state.partitions = all
+
+        List<Map> existing = all.findAll { it.code != 1 }
+        Integer existingCount = (existing?.size() ?: 0) as Integer
+        if (!prefSpamGuard || device.currentValue("partitionCount")?.toString() != existingCount.toString()) {
+            sendEvent(name:"partitionCount", value: existingCount)
+        }
+
+        // fan-out to children
+        existing.each { Map p ->
+            def ch = _ensurePartitionChild(p.partitionId as Integer)
+            if (ch) { _applyPartition(p) }
+        }
+
+        // reconcile children set
+        try {
+            _reconcilePartitionChildren(existing.collect { (it.partitionId as Integer) })
+        } catch (e) {
+            logWarn("reconcile partition children failed: ${e}")
+        }
+    }
+	  // ---------- NEW: ensure siren children exist ----------
+    childSirenEnsure("ext", "External Siren", 1)
+    childSirenEnsure("int", "Internal Siren", 2)
+    // ------------------------------------------------------
+    
+    // Discovery completion
+    if (m.lastPanelEvent?.toString() == "userNames") {
+        sendEvent(name:"discoveryState", value:"done")
+        sendEvent(name:"discoveryLastTs", value:_nowIso())
+        state.discBusy = false
+        logInfo("Discovery chain completed")
+    }
+
+    logTrace("_applyPanel END")
+}
+
+/* Zone apply: forwards to zone child driver (must implement applyZone(Map)) */
+private void _applyZone(Map z) {
+    if (!(z instanceof Map)) return
+    Integer zid = _asInt(z.zoneId)
+    if (!zid) { logWarn("Zone payload missing zoneId: ${z}"); return }
+    def child = _getOrCreateChild(zid, z.zoneName as String)
+    if (!child) { logWarn("Child missing for zone ${zid}"); return }
+    if (!child.getDataValue("zoneId")) {                         // CHANGED: ensure zoneId dataValue present after apply
+        child.updateDataValue("zoneId", "${zid}")                // CHANGED
+    }
+    logTrace("_applyZone zid=${zid}")
+    try { child.applyZone(z) } catch (e) { logWarn("applyZone failed for zone ${zid}: ${e}") }
+}
+
+/* Partition apply: updates/creates partition child and maps code→mode */
+private void _applyPartition(Map p) {
+    if (!(p instanceof Map)) return
+    Integer pid  = (p.partitionId ?: 0) as Integer
+    Integer code = (p.code ?: 0) as Integer
+    String  lbl  = (p.label ?: "Unknown").toString()
+    if (pid <= 0) return
+    if (code == 1) return  // NotExist
+
+    logTrace("_applyPartition pid=${pid} code=${code} (${lbl})")
+
+    String dni = _childDniForPartition(pid)
+    def child = getChildDevice(dni)
+    if (!child) {
+        try {
+            String prefix = (settings?.childPrefix ?: "PIMA Force") // CHANGED: use user prefix for created partition
+            child = addChildDevice(_ns(), _childTypePart(), dni,
+			    [label: "${prefix} Partition #${pid}", isComponent: true, name: "PIMA Force Partition ${pid}"]) // CHANGED
+            child.sendEvent(name:"partitionId", value: pid)
+            logInfo("Created partition child pid=${pid}")
+        } catch (e) {
+            logWarn("Failed to create partition child ${pid}: ${e}")
+            return
+        }
+    }
+
+    String mode =
+        (code == 2) ? "disarmed" :
+        (code == 3) ? "away"     :
+        (code == 4) ? "home1"    :
+        (code == 5) ? "home2"    :
+        (code == 6) ? "home3"    :
+        (code == 7) ? "home4"    :
+        (code == 8) ? "shabbatOn" :
+        (code == 9) ? "shabbatOff" : "unknown"
+
+    child.sendEvent(name:"exists", value:"true")
+    child.sendEvent(name:"partitionId", value: pid)
+    child.sendEvent(name:"mode", value: mode)
+    // defaults until per-partition telemetry is wired
+    child.sendEvent(name:"ready", value:"notReady")
+    child.sendEvent(name:"alarm", value:"idle")
+    child.sendEvent(name:"trouble", value:"ok")
+    child.sendEvent(name:"bypassedCount", value: 0)
+}
+
+
+/* ============================ */
+/* ===== Utility helpers ===== */
+/* ============================ */
+
+// ===== Partition alarm cool-down helper =====
+
+private Integer _alarmCooldownSecs() {
+    Integer v
+    try {
+        v = (settings?.prefAlarmCooldown as Integer)
+    } catch (Exception e) {
+        v = null
+    }
+    if (v == null) v = 0
+    if (v < 0) v = 0
+    return v
+}
+
+private _setIf(Map m, String key) {
+    if (!m.containsKey(key)) return
+    def val = m[key]
+    if (prefSpamGuard) {
+        def cur = device.currentValue(key)
+        if (cur?.toString() == val?.toString()) return
+    }
+    sendEvent(name:key, value: val)
+}
+
+private _setIfJson(Map m, String key) {
+    if (!m.containsKey(key)) return
+    def json = JsonOutput.toJson(m[key])
+    if (prefSpamGuard) {
+        def cur = device.currentValue(key)
+        if (cur?.toString() == json) return
+    }
+    sendEvent(name:key, value: json)
+    state[key] = m[key]
+}
+
+def pollPartitions() {
+    logInfo("pollPartitions() → request DATA-REQ 2310")
+    emitNrRequest([type:"data-req", id:2310, start:1])
+}
+
+// CHANGED: helper to infer existing child prefix from labels for legacy installations
+private String _inferChildPrefixFromLabels() {
+    def children = getChildDevices() ?: []
+    if (!children) return null
+
+    def cd = children.find { it.label }       // first child with a non-empty label
+    if (!cd) return null
+
+    String lbl = cd.label as String
+
+    // Try known patterns: "<prefix> Zone #<n>", "<prefix> Partition #<n>", "<prefix> External Siren", etc.
+    def m = (lbl =~ /^(.*)\s+Zone\s+#\d+/)
+    if (!m.matches()) m = (lbl =~ /^(.*)\s+Partition\s+#\d+/)
+    if (!m.matches()) m = (lbl =~ /^(.*)\s+External Siren$/)
+    if (!m.matches()) m = (lbl =~ /^(.*)\s+Internal Siren$/)
+    if (!m.matches()) m = (lbl =~ /^(.*)\s+Siren$/)
+
+    return m.matches() ? (m[0][1] as String) : null
+}
+
+// Remember last requested arm op per partition (Hubitat → PIMA)
+private void _rememberLastArmRequest(Integer part, String op) {
+    if (!part || !op) return
+    Map m = (state.lastArmReq instanceof Map) ? state.lastArmReq : [:]
+    m[part.toString()] = op
+    state.lastArmReq = m
+    logDebug("lastArmReq[${part}] = ${op}")
+}
+
+// Optional: clear remembered request (on disarm)
+private void _clearLastArmRequest(Integer part) {
+    if (!part) return
+    if (state.lastArmReq instanceof Map) {
+        state.lastArmReq.remove(part.toString())
+        logDebug("lastArmReq[${part}] cleared")
+    }
+}
+
+// Helper functions to date display formats
+@Field static final String DF_ISO    = "yyyy-MM-dd HH:mm:ss"
+@Field static final String DF_EU_24H = "dd/MM/yyyy HH:mm:ss"
+@Field static final String DF_US_12H = "MM/dd/yyyy hh:mm:ss a"
+@Field static final String DF_SHORT  = "dd-MM-yy HH:mm"
+
+private String fmtTs(Long millis = null) {
+    Date d = millis != null ? new Date(millis) : new Date()
+    TimeZone tz = location?.timeZone ?: TimeZone.getTimeZone("UTC")
+
+    String pref = settings?.dateFormat ?: "ISO"
+    String pattern
+
+    switch(pref) {
+        case "EU_24H":
+            pattern = DF_EU_24H
+            break
+        case "US_12H":
+            pattern = DF_US_12H
+            break
+        case "SHORT":
+            pattern = DF_SHORT
+            break
+        case "ISO":
+        default:
+            pattern = DF_ISO
+            break
+    }
+
+    return d.format(pattern, tz)
+}
+
+// Parse ISO-like timestamps from Node-RED (e.g. 2025-11-19T14:17:10.750Z) into millis
+private Long _parseIsoUtcToMillis(String s) {
+    if (!s) return null
+    try {
+        // with millis + timezone/’Z’
+        return Date.parse("yyyy-MM-dd'T'HH:mm:ss.SSSX", s).time
+    } catch (Exception e1) {
+        try {
+            // without millis
+            return Date.parse("yyyy-MM-dd'T'HH:mm:ssX", s).time
+        } catch (Exception e2) {
+            try {
+                // explicit 'Z' fallback
+                return Date.parse("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", s).time
+            } catch (Exception e3) {
+                logWarn("Failed to parse ISO timestamp '${s}': ${e3}")
+                return null
+            }
+        }
+    }
+}
+
+
+// =======================
+// ZONE CHILD LOOKUP
+// =======================
+private def findZoneChild(Integer zone, Integer part) {
+    if (!zone) return null
+
+    def children = getChildDevices()
+    if (!children) {
+        logWarn "findZoneChild(): no child devices exist (zone=${zone}, part=${part})"
+        return null
+    }
+
+    // CHANGED: prefer attribute-based lookup (zoneId attribute)
+    def byAttr = children.find { cd ->
+        def zidAttr = cd.currentValue("zoneId")
+        zidAttr?.toString()?.isInteger() && zidAttr.toInteger() == zone
+    }
+    if (byAttr) return byAttr
+
+    // CHANGED: fallback to dataValue("zoneId") if present
+    def byData = children.find { cd ->
+        def zid = cd.getDataValue("zoneId")
+        zid?.isInteger() && zid.toInteger() == zone
+    }
+    if (byData) return byData
+
+    // CHANGED: fallback to DNI suffix "-Z<zone>"
+    def byDni = children.find { cd ->
+        cd.deviceNetworkId?.endsWith("-Z${zone}")
+    }
+    if (byDni) return byDni
+
+    // Diagnostics (unchanged intent)
+    logWarn "findZoneChild(): no match for zone ${zone}, part ${part}. Existing children:"
+    children.each { cd ->
+        logWarn "  child dni='${cd.deviceNetworkId}', label='${cd.label}', name='${cd.name}', " +
+                 "zoneId='${cd.getDataValue("zoneId")}', partition='${cd.getDataValue("partition")}'"
+    }
+
+    return null
+}
+
+// =======================
+// PARTITION CHILD LOOKUP
+// =======================
+
+private def findPartitionChild(Integer part) {
+    if (!part) return null
+
+    def children = getChildDevices()
+    if (!children) {
+        logWarn "findPartitionChild(): no child devices exist (part=${part})"
+        return null
+    }
+
+    // 1) Preferred: by attribute partitionId (from applyPartition)
+    def byAttr = children.find { cd ->
+        def pid = cd.currentValue("partitionId")
+        pid?.toString()?.isInteger() && pid.toInteger() == part
+    }
+    if (byAttr) return byAttr
+
+    // 2) By DNI suffix "-P<part>" (e.g. "...-P1")
+    def byDni = children.find { cd ->
+        cd.deviceNetworkId?.endsWith("-P${part}")
+    }
+    if (byDni) return byDni
+
+    // 3) By label containing "Partition <part>"
+    def byLabel = children.find { cd ->
+        cd.label?.toLowerCase()?.contains("partition ${part}".toLowerCase())
+    }
+    if (byLabel) return byLabel
+
+    // 4) Diagnostics
+    logWarn "findPartitionChild(): no match for partition ${part}. Existing children:"
+    children.each { cd ->
+        logWarn "  child dni='${cd.deviceNetworkId}', label='${cd.label}', name='${cd.name}', partitionId='${cd.currentValue("partitionId")}'"
+    }
+
+    return null
+}
+
+/* ============================== */
+/* ===== Child prefix apply ===== */
+/* ============================== */
+
+private void _applyChildPrefixToLabels(String prefix) {
+    // CHANGED: central helper to apply childPrefix to all relevant children
+    def children = getChildDevices() ?: []
+    children.each { cd ->
+        String dni = cd.deviceNetworkId ?: ""
+        try {
+            if (dni.contains("-Z")) {
+                Integer zid = null
+                def attrZ = cd.currentValue("zoneId")
+                if (attrZ?.toString()?.isInteger()) {
+                    zid = attrZ.toInteger()
+                } else {
+                    def m = (dni =~ /-Z(\d+)$/)
+                    if (m.matches()) zid = (m[0][1] as String).toInteger()
+                }
+                if (zid != null) {
+                    String zn = cd.currentValue("zoneName")?.toString()
+                    String lbl = "${prefix} Zone #${zid}" + (zn ? " (${zn})" : "")
+                    cd.label = lbl
+                }
+            } else if (dni.contains("-P")) {
+                Integer pid = null
+                def attrP = cd.currentValue("partitionId")
+                if (attrP?.toString()?.isInteger()) {
+                    pid = attrP.toInteger()
+                } else {
+                    def m = (dni =~ /-P(\d+)$/)
+                    if (m.matches()) pid = (m[0][1] as String).toInteger()
+                }
+                if (pid != null) {
+                    String lbl = "${prefix} Partition #${pid}"
+                    cd.label = lbl
+                }
+            } else if (dni.contains("-siren-")) {
+                String suffix =
+                    dni.endsWith("-siren-ext") ? "External Siren" :
+                    dni.endsWith("-siren-int") ? "Internal Siren" :
+                    "Siren"
+                cd.label = "${prefix} ${suffix}"
+            }
+        } catch (e) {
+            logWarn("Failed to update label for child DNI=${dni}: ${e}") // CHANGED: protect against errors in renaming
+        }
+    }
+}
+
+private static Integer _asInt(v) { try { return (v as Integer) } catch (e) { return null } }
+private String _nowIso() { fmtTs() }
+private String _childTypePart() { "PIMA Force Partition" }
+
+private logInfo(msg) {  log.info  "[PANEL] ${msg}" }
+private logDebug(msg){ if (prefDebug) log.debug "[PANEL] ${msg}" }
+private logTrace(msg){ if (prefTrace) log.debug "[PANEL][TRACE] ${msg}" }
+private logWarn(msg){  log.warn  "[PANEL] ${msg}" }
