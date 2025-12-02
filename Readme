@@ -1,0 +1,316 @@
+PIMA Force – Hubitat Integration
+
+A complete integration of PIMA Force alarm panels with Hubitat Elevation, built around a reliable Node-RED → Hubitat bridge. This integration provides real-time events, accurate device representation, and full control of your alarm system directly from Hubitat.
+
+What This Integration Provides
+
+Real-Time Alarm System Visibility
+
+Instant zone events: open, closed, tamper, alarm
+
+All partition states: ready, not ready, exit delay, entry delay, armed home/away, alarm
+
+Panel-wide events: troubles, heartbeat, connectivity
+
+Sirens represented as actual on/off switch devices
+
+Direct Control from Hubitat
+
+Arm Home / Arm Away
+
+Disarm
+
+Activate or deactivate sirens
+
+Read partition delays (exit/entry)
+
+Query and refresh panel configuration
+
+Clean Hubitat Device Structure
+
+The integration creates:
+
+Device Type
+
+Purpose
+
+PIMA Force Alarm Panel (parent device)
+
+Main controller and state aggregator
+
+Partition devices
+
+Arm/disarm + all partition status
+
+Zone devices
+
+Real-time open/close + alarm + tamper
+
+Siren devices
+
+Pure ON/OFF (correct mapping for PIMA hardware)
+
+All children are created automatically when the system receives initial data from Node-RED.
+
+Rock-Solid Communication Layer
+
+Using Node-RED guarantees:
+
+Stable TCP session with the PIMA panel
+
+Automatic reconnect
+
+Full PIMA protocol parsing (EVENT + OPERATION + DATA-REQ)
+
+Fallbacks and safety logic
+
+Clean Maker API communication to Hubitat
+
+Requirements
+
+Before starting:
+
+You must have the installer password for your PIMA Force system.
+
+Your PIMA Force panel must run the JSON-enabled firmware (contact PIMA support to update it).
+
+Hardware
+
+PIMA Force alarm panel with LAN module
+
+A server running Node-RED (Raspberry Pi, Proxmox VM, etc.)
+
+Software
+
+Hubitat Maker API (built-in)
+
+Node-RED 3.x or later [we need to mention the pallates we are using so the user can instal them]
+
+This repository (drivers + Node-RED flow)
+
+Installation Guide
+
+1. PIMA Force Panel Configuration
+
+Before installing the integration, verify the following on your PIMA panel:
+
+LAN module is installed and enabled
+
+Panel has a static IP address
+
+Installer access is available
+
+JSON firmware is installed
+
+LAN module is reachable from Node-RED
+
+2. Install Hubitat Drivers
+
+Install the following files from /drivers/:
+
+PIMA Force Alarm Panel (parent)
+
+PIMA Force Partition (child)
+
+PIMA Force Zone (child)
+
+PIMA Force Siren (child)
+
+You should install these manually as I am not uploading to HPM for now.
+
+3. Create the Hubitat Parent Device
+
+Go to Devices → Add Virtual Device
+
+Name it (e.g., PIMA Force Alarm Panel)
+
+Select driver: PIMA Force Alarm Panel
+
+Save device
+
+The child devices will be created later automatically.
+
+4. Configure Maker API
+
+Add a new Maker API instance
+
+Allow control of the parent device
+
+Copy:
+
+Maker API App ID
+
+Maker API Access Token
+
+Maker API Base URL
+
+Paste them into the parent driver preferences.
+
+5. Install the Node-RED Flow (Mandatory)
+
+Import the JSON flow from /node-red/pima-flow.json.
+
+This flow includes:
+
+A persistent TCP connection to the PIMA LAN module
+
+Full PIMA protocol parsing (EVENT / OPERATION / DATA-REQ)
+
+Automatic reconnect and connection health monitoring
+
+Bridge-state and heartbeat reporting
+
+Automatic Maker API communication to Hubitat
+
+Test inject nodes for troubleshooting
+
+Required Node-RED Palettes
+
+Before deploying the flow, install these palettes:
+
+node-red-contrib-buffer-parser (protocol decoding)
+
+node-red-contrib-hubitat (Maker API integration)
+
+node-red-dashboard (optional)
+
+node-red-contrib-moment (optional)
+
+What You Must Configure in Node-RED
+
+The flow receives its configuration directly from Hubitat using the syncConfig command. You do not need to manually enter Maker API URLs or PIMA credentials in Node-RED.
+
+You must verify only:
+
+The TCP node points to the correct PIMA panel IP and port
+
+The Hubitat nodes belong to the Hubitat palette (installed above)
+
+After deploying the flow, it connects to the panel automatically and begins sending frames to Hubitat.
+
+Make sure the node-red-contrib-hubitat palette is installed so the flow can communicate with Hubitat.
+
+6. Initial Sync
+
+As soon as the PIMA panel sends DATA-REQ information:
+
+All partitions are created
+
+All zones are created with correct labels
+
+All sirens/outputs are created
+
+The panel state becomes active
+
+You now see real-time events inside Hubitat.
+
+Using the Integration
+
+Arm / Disarm
+
+On a Partition device:
+
+armHome
+
+armAway
+
+disarm
+
+Zone Activity
+
+Each zone device updates:
+
+open / closed
+
+alarm events
+
+tamper
+
+lastEventTs
+
+Siren Control
+
+Each siren acts as an ON/OFF switch.
+
+Presence / Connectivity
+
+The parent device reports:
+
+bridgeState
+
+heartbeatTs
+
+If the PIMA panel becomes unreachable, the device shows not present.
+
+What You Must Configure
+
+In Hubitat:
+
+Install all 4 drivers
+
+Create one parent device
+
+Set MakerAPI URL + token in the parent device
+
+Save preferences
+
+In Node-RED:
+
+You do not need to manually configure credentials or MakerAPI URLs. Hubitat sends all required settings to Node-RED via the syncConfig command.
+
+You only need to verify:
+
+The TCP node points to the correct PIMA LAN IP + port
+
+The Hubitat palette is installed (node-red-contrib-hubitat)
+
+Deploy the flow
+
+In your LAN:
+
+Ensure PIMA LAN module has a static IP
+
+Ensure Node-RED can reach Hubitat and PIMA
+
+How It Works
+
+[PIMA Panel]  ←TCP→  [Node-RED Parser]  → MakerAPI →  [Hubitat Parent Device]
+                                                       ↓ auto-creates
+                                             [Partitions] [Zones] [Sirens]
+
+Updates & Maintenance
+
+Updating Node-RED Flow
+
+Re-import the JSON file or update only the changed nodes.
+
+Updating Hubitat Drivers
+
+Replace the drivers and click Save.
+
+PIMA Firmware
+
+Some users may need a manual firmware update from PIMA support.
+
+Troubleshooting
+
+No child devices appear
+
+Confirm MakerAPI settings
+
+Trigger manual syncConfig in Node-RED
+
+Check Node-RED logs for TCP failures
+
+Wrong timestamps
+
+Ensure Node-RED and Hubitat time settings are correct.
+
+Event delay
+
+PIMA panels send events with a built-in ~1 second minimum interval.
+
+Support
+
+Open GitHub Issues for bugs or feature requests.
+
