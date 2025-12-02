@@ -1,0 +1,160 @@
+/**
+ * PIMA Force Zone (Child)
+ * Namespace: amithalp
+ * Author: Amit Halperin
+ *
+ * - Represents a single PIMA zone.
+ * - Protocol-pure attributes only (no type/class).   // CHANGED: removed 'Dashboard profile' mention
+ *
+ * Parent calls: child.applyZone(Map z)
+ * Optional direct update: updateZone(String json)
+ */
+
+import groovy.json.JsonSlurper
+
+metadata {
+    definition(name: "PIMA Force Zone", namespace: "amithalp", author: "Amit Halperin") {
+        capability "ContactSensor"   // standard open/close sensor
+        capability "Sensor"          // generic; lets apps select it as a sensor
+
+        attribute "zoneId",      "number"
+        attribute "zoneName",    "string"
+        attribute "zoneState",   "string"
+        attribute "alarmState",  "string"
+        attribute "lastEvent",   "string"
+        attribute "lastEventTs", "string"
+
+        command "applyZone", [[name:"zoneJson*", type:"STRING"]]
+        command "notifyZoneOpenCloseEvent", [
+            [name:"contactVal*",    type:"STRING"],
+            [name:"zoneStateVal*",  type:"STRING"],
+            [name:"qual*",          type:"NUMBER"],
+            [name:"part*",          type:"NUMBER"]
+        ]
+        command "notifyZoneIntrusionEvent", [
+            [name:"alarmStateVal*", type:"STRING"],
+            [name:"zoneStateVal*",  type:"STRING"],
+            [name:"qual*",          type:"NUMBER"],
+            [name:"part*",          type:"NUMBER"],
+            [name:"codeStr*",       type:"STRING"]
+        ]
+    }
+
+    preferences {
+        input name:"prefDebug",     type:"bool", title:"Enable debug logging", defaultValue:false
+        input name:"prefTrace",     type:"bool", title:"Enable trace logging", defaultValue:false
+        input name:"prefSpamGuard", type:"bool", title:"Coalesce duplicate events", defaultValue:true
+        // CHANGED: removed unused prefDashboardProfile / prefInvertContact / prefSuppressMirrors
+    }
+}
+
+def installed() {
+    logInfo "installed()"
+    sendEvent(name: "contact",    value: "closed")
+    sendEvent(name: "alarmState", value: "idle")
+}
+
+def updated() {
+    logInfo "updated()"   // CHANGED: removed log of non-existent dashboard prefs
+}
+
+def refresh() { logDebug "Refresh requested" }
+
+// ===== Public API for parent =====
+def applyZone(Map z) {
+    _setIf(z, "zoneId")
+    _setIf(z, "zoneName")
+    _setIf(z, "partition")
+    _setIf(z, "zoneState")
+    _setIf(z, "alarmState")
+    _setIf(z, "bypass")
+    _setIf(z, "trouble")
+    _setIf(z, "tamper")
+    if (z.containsKey("battery")) sendEvent(name:"battery", value: _asInt(z.battery) ?: -1)
+    if (z.containsKey("signal"))  sendEvent(name:"signal",  value: _asInt(z.signal)  ?: 0)
+    _setIf(z, "supervision")
+    if (z.ts)        sendEvent(name:"lastEventTs", value: z.ts.toString())
+    if (z.lastEvent) sendEvent(name:"lastEvent",   value: z.lastEvent.toString())
+    if (z.rawCode)   sendEvent(name:"rawCode",     value: z.rawCode.toString())
+
+    // CHANGED: removed _emitMirrors() call (no dashboard profile logic)
+    logTrace "Applied zone keys: ${z.keySet()}"
+}
+
+// Optional direct update
+def updateZone(String json) {
+    if (!json) return
+    def obj
+    try { obj = new JsonSlurper().parseText(json) } catch (e) {
+        logWarn "Invalid JSON: ${e}"; return
+    }
+    if (!(obj instanceof Map)) { logWarn "JSON root is not an object"; return }
+    applyZone(obj as Map)
+}
+
+def setBypass(String onOff) {
+    def v = (onOff?.toLowerCase() in ["on","true","1"]) ? "on" : "off"
+    sendEvent(name:"bypass", value: v)
+    try { parent?.bypassZone(device.currentValue("zoneId") as Integer, null) } catch (ignored) {}
+}
+
+// ===== Live EVENT hooks from parent =====
+
+// Called by parent for 760 open/close events
+def notifyZoneOpenCloseEvent(String contactVal, String zoneStateVal, Integer qual, Integer part) {
+    def zid = device.currentValue("zoneId") ?: "?"
+
+    // DEBUG: full technical info
+    logDebug "760 event: part=${part}, qual=${qual}, contact=${contactVal}, zoneState=${zoneStateVal}"
+
+    // INFO: concise, user-oriented
+    logInfo "is now ${contactVal}"// (zoneState=${zoneStateVal}, 760/${qual})"
+
+    sendEvent(
+        name: "contact",
+        value: contactVal,
+        descriptionText: "Zone ${zid} is ${contactVal} (760/${qual})"
+    )
+    sendEvent(name: "zoneState", value: zoneStateVal)
+}
+
+
+// Called by parent for 130 intrusion events
+def notifyZoneIntrusionEvent(String alarmStateVal, String zoneStateVal, Integer qual, Integer part, String codeStr) {
+    // DEBUG: full technical info
+    logDebug "130 event: part=${part}, qual=${qual}, alarmState=${alarmStateVal}, zoneState=${zoneStateVal}, code=${codeStr}"
+
+    // INFO: concise, user-oriented
+    logInfo "ALARM: ${alarmStateVal}"// (zoneState=${zoneStateVal}, 130/${qual}, code=${codeStr})"
+
+    sendEvent(name: "alarmState", value: alarmStateVal)
+    sendEvent(name: "zoneState",  value: zoneStateVal)
+}
+
+// ===== Utilities =====
+private _setIf(Map m, String key) {
+    if (!m.containsKey(key)) return
+    def val = m[key]
+    if (prefSpamGuard) {
+        def cur = device.currentValue(key)
+        if (cur?.toString() == val?.toString()) return
+    }
+    sendEvent(name:key, value: val)
+}
+
+private String _zoneLabel() {
+    def zid   = device.currentValue('zoneId') ?: '?'
+    def zname = device.currentValue('zoneName')
+    return zname ? "Zone ${zid} (${zname})" : "Zone ${zid}"
+}
+
+
+// CHANGED: removed _emitMirrors() and _emitIfChanged() as they were only used by dashboard profile
+
+private static Integer _asInt(v) { try { return (v as Integer) } catch (e) { return null } }
+
+private logInfo(msg){  log.info  "[${_zoneLabel()}] ${msg}" }
+private logDebug(msg){ if (prefDebug) log.debug "[${_zoneLabel()}] ${msg}" }
+private logTrace(msg){ if (prefTrace) log.trace "[${_zoneLabel()}] ${msg}" }
+private logWarn(msg){  log.warn  "[${_zoneLabel()}] ${msg}" }
+
